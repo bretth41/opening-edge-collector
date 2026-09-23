@@ -1,2 +1,4 @@
-httpx==0.27.2
-pandas>=2.2.0
+httpx
+
+streamlit>=1.38
+pandas>=2.2

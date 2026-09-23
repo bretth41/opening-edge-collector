@@ -1,7 +1,7 @@
 [build]
-builder = "RAILPACK"
+builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python collector.py"
+startCommand = "sh -c 'python collector.py & streamlit run dashboard.py --server.address 0.0.0.0 --server.port ${PORT:-8501} --server.headless true'"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
