@@ -1,4 +1,4 @@
-import asyncio, os, sqlite3, time
+import asyncio, os, sqlite3, time, json
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -33,6 +33,11 @@ CREATE INDEX IF NOT EXISTS ix_exposure_ticker_time ON strike_exposure(ticker, ob
 CREATE TABLE IF NOT EXISTS collector_events (
   observed_at_et TEXT NOT NULL, event_type TEXT NOT NULL, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS phase2_raw (
+  observed_at_et TEXT NOT NULL, session_window TEXT NOT NULL, endpoint TEXT NOT NULL,
+  ticker TEXT, contract TEXT, payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_phase2_time ON phase2_raw(observed_at_et, endpoint);
 '''
 FIELDS = [
  'call_delta_oi','call_delta_vol','call_delta_ask','call_delta_bid','put_delta_oi','put_delta_vol','put_delta_ask','put_delta_bid',
@@ -91,6 +96,77 @@ async def collect_once(client,label):
         rows=await fetch_ticker(client,ticker); total += save_snapshot(observed,label,ticker,rows)
     event("SNAPSHOT",f"{label}: saved {total} strike rows for {','.join(TICKERS)}")
 
+
+PHASE2_BASE = "https://api.unusualwhales.com"
+
+async def phase2_get(client, path, params=None):
+    r = await client.get(PHASE2_BASE + path, params=params or {}, timeout=25)
+    if r.status_code in (401,403):
+        return r.status_code, None
+    r.raise_for_status()
+    return r.status_code, r.json()
+
+def save_phase2(observed, label, endpoint, ticker, contract, payload):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO phase2_raw VALUES (?,?,?,?,?,?)",
+            (observed.isoformat(), label, endpoint, ticker, contract, json.dumps(payload, separators=(",",":")))
+        )
+        con.commit()
+
+async def phase2_probe(client):
+    # Probe documented REST endpoints using today's SPX 0DTE expiry. No WebSockets required.
+    today = datetime.now(ET).date().isoformat()
+    probes = [
+        ("CONTRACTS", "/api/stock/SPX/option-contracts", {"expiry": today, "limit": 10}),
+        ("GREEKS", "/api/stock/SPX/greeks", {"expiry": today}),
+        ("TRADES", "/api/option-trades", {"ticker_symbol": "SPX", "expiry_dates[]": today, "limit": 10, "intraday_only": "true"}),
+    ]
+    first_contract = None
+    for name, path, params in probes:
+        try:
+            status, payload = await phase2_get(client, path, params)
+            if status in (401,403):
+                event(f"PHASE2_{name}_NO_ACCESS", f"HTTP {status}")
+                continue
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            event(f"PHASE2_{name}_OK", f"returned {len(data)} rows")
+            if name == "CONTRACTS" and data:
+                for row in data:
+                    if isinstance(row, dict):
+                        first_contract = row.get("option_symbol") or row.get("id") or row.get("symbol")
+                        if first_contract: break
+        except Exception as e:
+            event(f"PHASE2_{name}_FAILED", f"{type(e).__name__}: {e}")
+    if first_contract:
+        try:
+            status, payload = await phase2_get(client, f"/api/option-contract/{first_contract}/intraday", {"date": today})
+            if status in (401,403): event("PHASE2_INTRADAY_NO_ACCESS", f"HTTP {status}")
+            else:
+                data = payload.get("data", []) if isinstance(payload, dict) else []
+                event("PHASE2_INTRADAY_OK", f"{first_contract} returned {len(data)} minute rows")
+        except Exception as e:
+            event("PHASE2_INTRADAY_FAILED", f"{type(e).__name__}: {e}")
+
+async def collect_phase2_once(client, label, observed):
+    # Preserve raw SPX 0DTE chain/Greek/trade responses each minute. Raw storage prevents
+    # us from accidentally throwing away a field before we know which ones predict edge.
+    today = observed.date().isoformat()
+    requests = [
+        ("spx_0dte_contracts", "/api/stock/SPX/option-contracts", {"expiry": today, "limit": 500}),
+        ("spx_0dte_greeks", "/api/stock/SPX/greeks", {"expiry": today}),
+        ("spx_0dte_trades", "/api/option-trades", {"ticker_symbol": "SPX", "expiry_dates[]": today, "limit": 500, "intraday_only": "true"}),
+    ]
+    saved=0
+    for name,path,params in requests:
+        try:
+            status,payload=await phase2_get(client,path,params)
+            if status in (401,403): continue
+            save_phase2(observed,label,name,"SPX",None,payload); saved += 1
+        except Exception as e:
+            event("PHASE2_ERROR", f"{name}: {type(e).__name__}: {e}")
+    if saved: event("PHASE2_SNAPSHOT", f"{label}: saved {saved} raw SPX 0DTE datasets")
+
 async def main():
     if not UW_TOKEN: raise SystemExit("UW_TOKEN is missing. Add it in Railway > service > Variables.")
     init_db(); event("START",f"DB={DB_PATH}; tickers={TICKERS}; windows=09:25-10:30 & 15:30-16:00 ET")
@@ -100,6 +176,7 @@ async def main():
         try:
             rows=await fetch_ticker(client,"SPY")
             event("UW_TEST_OK",f"SPY endpoint returned {len(rows)} rows")
+            await phase2_probe(client)
         except Exception as e:
             event("UW_TEST_FAILED",str(e)); raise
         last_key=None
@@ -108,7 +185,9 @@ async def main():
             minute_key=now.strftime('%Y-%m-%d %H:%M')
             if label and minute_key != last_key:
                 started=time.monotonic()
-                try: await collect_once(client,label)
+                try:
+                    await collect_once(client,label)
+                    await collect_phase2_once(client,label,datetime.now(ET).replace(second=0,microsecond=0))
                 except Exception as e: event("ERROR",f"{type(e).__name__}: {e}")
                 last_key=minute_key
                 await asyncio.sleep(max(1,POLL_SECONDS-(time.monotonic()-started)))
