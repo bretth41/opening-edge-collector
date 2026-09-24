@@ -1,4 +1,4 @@
-import os,secrets,sqlite3
+import os,secrets,sqlite3,asyncio,json
 from pathlib import Path
 from typing import Optional
 import pandas as pd
@@ -17,6 +17,38 @@ def browser(c:Optional[HTTPBasicCredentials]=Depends(sec)):
 def latest(w,t):
     d=q("SELECT max(substr(observed_at_et,1,10)) d FROM strike_exposure WHERE session_window=? AND ticker=?",(w,t))
     return None if d.empty else d.iloc[0].d
+
+def latest_snapshot(window,ticker):
+    d=q("SELECT max(observed_at_et) t FROM strike_exposure WHERE session_window=? AND ticker=?",(window,ticker))
+    if d.empty or pd.isna(d.iloc[0].t): return None
+    return str(d.iloc[0].t)
+
+def emit_signal_snapshot(window,ticker="SPY",radius=8):
+    t=latest_snapshot(window,ticker)
+    if not t:return None
+    day=t[:10]
+    w=warnings(DB,day,window,ticker,radius)
+    current=[e for e in w.get("warnings",[]) if str(e.get("time"))==t]
+    payload={"version":"3.2-log-bridge","causal":True,"window":window,"ticker":ticker,
+             "snapshot_time":t,"warning_count":len(current),"warnings":current}
+    print("OPENING_EDGE_SIGNAL "+json.dumps(payload,separators=(",",":")),flush=True)
+    return t
+
+async def signal_log_loop():
+    seen={}
+    while True:
+        try:
+            for window in ("MORNING","CLOSE"):
+                t=latest_snapshot(window,"SPY")
+                if t and seen.get(window)!=t:
+                    emit_signal_snapshot(window,"SPY",8);seen[window]=t
+        except Exception as e:
+            print("OPENING_EDGE_BRIDGE_ERROR "+json.dumps({"error":type(e).__name__,"message":str(e)[:240]}),flush=True)
+        await asyncio.sleep(15)
+
+@app.on_event("startup")
+async def start_signal_bridge():
+    asyncio.create_task(signal_log_loop())
 @app.get("/health")
 def health():return {"ok":DB.exists(),"version":"3.2-complete"}
 @app.get("/api/research/warnings")
