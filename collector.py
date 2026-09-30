@@ -9,12 +9,29 @@ DATA_DIR=Path(os.getenv("EDGE_DATA_DIR","/data" if Path("/data").exists() else "
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 DB_PATH=Path(os.getenv("EDGE_DB",str(DATA_DIR/"opening_edge_v2.db")))
 UW_TOKEN=os.environ.get("UW_TOKEN")
+
+# Existing broad aggregate collection (all expiries combined).
 TICKERS=[x.strip() for x in os.getenv("EDGE_TICKERS","SPY,SPXW").split(",") if x.strip()]
+
+# NEW: expiry-isolated structure collection.
+# Default to SPY because this is the direct analogue to the Quant SPY interval maps
+# and keeps API usage modest. Set EDGE_EXPIRY_TICKERS=SPY,SPXW later if desired.
+EXPIRY_TICKERS=[x.strip() for x in os.getenv("EDGE_EXPIRY_TICKERS","SPY").split(",") if x.strip()]
+
+# Collect the first N listed expiries beginning with today's expiry when available.
+# With 2, this normally means 0DTE + 1DTE. Around weekends/holidays the second
+# listed expiry may have calendar_dte > 1; we store both expiry_rank and calendar_dte
+# so this is explicit rather than silently mislabelled.
+EXPIRY_SLOTS=int(os.getenv("EDGE_EXPIRY_SLOTS","2"))
+
 POLL_SECONDS=int(os.getenv("EDGE_POLL_SECONDS","60"))
 UW_BASE="https://api.unusualwhales.com"
 EXPOSURE_URL=UW_BASE+"/api/stock/{ticker}/spot-exposures/strike"
 MARKET_START,MARKET_END=dtime(9,25),dtime(16,0)
 OPTION_RE=re.compile(r"^(?P<root>[A-Z]+)(?P<date>\d{6})(?P<cp>[CP])(?P<strike>\d{8})$")
+
+# Cache listed expiries once per ticker/trading date.
+_EXPIRY_CACHE={}
 
 SCHEMA="""
 CREATE TABLE IF NOT EXISTS strike_exposure (
@@ -30,6 +47,43 @@ CREATE TABLE IF NOT EXISTS strike_exposure (
  put_charm_oi REAL,put_charm_vol REAL,put_charm_ask REAL,put_charm_bid REAL,
  PRIMARY KEY(observed_at_et,ticker,strike));
 CREATE INDEX IF NOT EXISTS ix_exposure_ticker_time ON strike_exposure(ticker,observed_at_et);
+
+-- NEW: expiry-isolated strike structure.
+-- Stores raw Greeks from UW plus per-side OI/volume/ask/bid volume from the
+-- corresponding expiry's option contracts. This preserves the source inputs so
+-- we can derive/test GEX/DEX/CHEX/VEX conventions later without baking assumptions
+-- into collection.
+CREATE TABLE IF NOT EXISTS expiry_strike_structure (
+ observed_at_et TEXT NOT NULL,
+ session_window TEXT NOT NULL,
+ ticker TEXT NOT NULL,
+ expiry TEXT NOT NULL,
+ expiry_rank INTEGER NOT NULL,
+ calendar_dte INTEGER NOT NULL,
+ strike REAL NOT NULL,
+ underlying_price REAL,
+
+ call_delta REAL, put_delta REAL,
+ call_gamma REAL, put_gamma REAL,
+ call_charm REAL, put_charm REAL,
+ call_vanna REAL, put_vanna REAL,
+ call_vega REAL, put_vega REAL,
+ call_theta REAL, put_theta REAL,
+ call_rho REAL, put_rho REAL,
+ call_volatility REAL, put_volatility REAL,
+
+ call_open_interest REAL, put_open_interest REAL,
+ call_volume REAL, put_volume REAL,
+ call_ask_volume REAL, put_ask_volume REAL,
+ call_bid_volume REAL, put_bid_volume REAL,
+ call_mid_volume REAL, put_mid_volume REAL,
+
+ PRIMARY KEY(observed_at_et,ticker,expiry,strike)
+);
+CREATE INDEX IF NOT EXISTS ix_expiry_structure_time
+ ON expiry_strike_structure(ticker,expiry,observed_at_et);
+CREATE INDEX IF NOT EXISTS ix_expiry_structure_rank
+ ON expiry_strike_structure(ticker,expiry_rank,observed_at_et,strike);
 
 CREATE TABLE IF NOT EXISTS underlying_snapshot(
  observed_at_et TEXT NOT NULL,session_window TEXT NOT NULL,ticker TEXT NOT NULL,price REAL,
@@ -58,6 +112,13 @@ FIELDS=['call_delta_oi','call_delta_vol','call_delta_ask','call_delta_bid','put_
 'call_gamma_oi','call_gamma_vol','call_gamma_ask','call_gamma_bid','put_gamma_oi','put_gamma_vol','put_gamma_ask','put_gamma_bid',
 'call_vanna_oi','call_vanna_vol','call_vanna_ask','call_vanna_bid','put_vanna_oi','put_vanna_vol','put_vanna_ask','put_vanna_bid',
 'call_charm_oi','call_charm_vol','call_charm_ask','call_charm_bid','put_charm_oi','put_charm_vol','put_charm_ask','put_charm_bid']
+
+EXPIRY_GREEK_FIELDS=[
+    'call_delta','put_delta','call_gamma','put_gamma',
+    'call_charm','put_charm','call_vanna','put_vanna',
+    'call_vega','put_vega','call_theta','put_theta',
+    'call_rho','put_rho','call_volatility','put_volatility'
+]
 
 def f(v):
     try:return float(v)
@@ -132,6 +193,146 @@ def save_exposure(observed,label,ticker,rows):
 def payload_rows(p):
     return p.get("data",[]) if isinstance(p,dict) and isinstance(p.get("data"),list) else []
 
+# ---------------- NEW: expiry-isolated collection ----------------
+
+async def listed_expiries(client,ticker,observed):
+    """
+    Returns listed expiries >= observed trading date, cached once per ticker/date.
+    We use exchange-listed expiries rather than naïvely adding 1 calendar day so
+    weekends/holidays are handled correctly.
+    """
+    day=observed.date().isoformat()
+    cache_key=(ticker,day)
+    if cache_key in _EXPIRY_CACHE:
+        return _EXPIRY_CACHE[cache_key]
+
+    status,payload=await uw_get(client,f"/api/stock/{ticker}/expiry-breakdown")
+    if status in (401,403) or not payload:
+        raise RuntimeError(f"UW expiry-breakdown unavailable for {ticker} (HTTP {status})")
+
+    expiries=sorted({
+        str(r.get("expires"))
+        for r in payload_rows(payload)
+        if r.get("expires") and str(r.get("expires"))>=day
+    })
+    _EXPIRY_CACHE[cache_key]=expiries
+    return expiries
+
+async def fetch_greeks_for_expiry(client,ticker,expiry):
+    status,payload=await uw_get(client,f"/api/stock/{ticker}/greeks",{"expiry":expiry})
+    if status in (401,403) or not payload:
+        raise RuntimeError(f"UW greeks unavailable for {ticker} {expiry} (HTTP {status})")
+    return payload_rows(payload)
+
+async def fetch_contracts_for_expiry(client,ticker,expiry):
+    """
+    Pulls all contracts for one expiry. The endpoint is capped at 500 rows, so
+    page until exhausted. These rows give OI plus cumulative intraday side volume.
+    """
+    rows=[];page=0
+    while True:
+        status,payload=await uw_get(
+            client,
+            f"/api/stock/{ticker}/option-contracts",
+            {"expiry":expiry,"page":page,"limit":500}
+        )
+        if status in (401,403) or not payload:
+            raise RuntimeError(f"UW option-contracts unavailable for {ticker} {expiry} (HTTP {status})")
+        data=payload_rows(payload)
+        if not data:break
+        rows.extend(data)
+        if len(data)<500:break
+        page+=1
+    return rows
+
+def contract_side_map(contract_rows,expiry):
+    """
+    Converts contract rows into (strike, side) -> OI/volume metadata.
+    We aggregate defensively in case UW returns duplicate/variant rows.
+    """
+    out={}
+    for r in contract_rows:
+        p=parse_contract(r.get("option_symbol"))
+        if not p:continue
+        exp,side,strike=p
+        if exp!=expiry:continue
+        key=(strike,side)
+        cur=out.setdefault(key,{
+            "open_interest":0.0,"volume":0.0,"ask_volume":0.0,
+            "bid_volume":0.0,"mid_volume":0.0
+        })
+        for k in list(cur):
+            v=f(r.get(k))
+            if v is not None:cur[k]+=v
+    return out
+
+def save_expiry_structure(observed,label,ticker,expiry,rank,spot,greek_rows,contract_rows):
+    calendar_dte=(datetime.fromisoformat(expiry).date()-observed.date()).days
+    contracts=contract_side_map(contract_rows,expiry)
+
+    cols=[
+        'observed_at_et','session_window','ticker','expiry','expiry_rank','calendar_dte',
+        'strike','underlying_price'
+    ]+EXPIRY_GREEK_FIELDS+[
+        'call_open_interest','put_open_interest',
+        'call_volume','put_volume',
+        'call_ask_volume','put_ask_volume',
+        'call_bid_volume','put_bid_volume',
+        'call_mid_volume','put_mid_volume'
+    ]
+    sql=f"INSERT OR REPLACE INTO expiry_strike_structure({','.join(cols)}) VALUES({','.join('?' for _ in cols)})"
+
+    vals=[]
+    for r in greek_rows:
+        strike=f(r.get("strike"))
+        if strike is None:continue
+
+        c=contracts.get((strike,"call"),{})
+        p=contracts.get((strike,"put"),{})
+
+        vals.append([
+            observed.isoformat(),label,ticker,expiry,rank,calendar_dte,strike,spot,
+            *[f(r.get(k)) for k in EXPIRY_GREEK_FIELDS],
+            f(c.get("open_interest")),f(p.get("open_interest")),
+            f(c.get("volume")),f(p.get("volume")),
+            f(c.get("ask_volume")),f(p.get("ask_volume")),
+            f(c.get("bid_volume")),f(p.get("bid_volume")),
+            f(c.get("mid_volume")),f(p.get("mid_volume"))
+        ])
+
+    with sqlite3.connect(DB_PATH) as con:
+        con.executemany(sql,vals)
+    return len(vals),calendar_dte
+
+async def collect_expiry_structure(client,label,observed,ticker,spot):
+    expiries=await listed_expiries(client,ticker,observed)
+    selected=expiries[:max(0,EXPIRY_SLOTS)]
+    if not selected:
+        event("EXPIRY_NO_DATA",f"{ticker}: no listed expiries found")
+        return 0
+
+    total=0
+    summaries=[]
+    for rank,expiry in enumerate(selected):
+        try:
+            greek_rows,contract_rows=await asyncio.gather(
+                fetch_greeks_for_expiry(client,ticker,expiry),
+                fetch_contracts_for_expiry(client,ticker,expiry)
+            )
+            n,calendar_dte=save_expiry_structure(
+                observed,label,ticker,expiry,rank,spot,greek_rows,contract_rows
+            )
+            total+=n
+            slot="0DTE" if calendar_dte==0 else (f"{calendar_dte}DTE")
+            summaries.append(f"{slot}/{expiry}:{n}")
+        except Exception as e:
+            event("EXPIRY_ERROR",f"{ticker} {expiry}: {type(e).__name__}: {e}")
+
+    event("EXPIRY_SNAPSHOT",f"{label} {ticker}: "+", ".join(summaries))
+    return total
+
+# ---------------- Existing option-path collection ----------------
+
 def choose_options(rows,spot):
     if spot is None:return []
     parsed=[]
@@ -193,32 +394,65 @@ def storage_health():
     except Exception as e:print(f"STORAGE_CHECK_ERROR {e}",flush=True)
 
 async def collect_once(client,label):
-    observed=datetime.now(ET).replace(second=0,microsecond=0);total=0;spot=None
+    observed=datetime.now(ET).replace(second=0,microsecond=0)
+    total=0
+    spots={}
+
+    # Preserve the existing all-expiry aggregate collector unchanged.
     for ticker in TICKERS:
         try:
-            rows=await fetch_exposure(client,ticker);n,px=save_exposure(observed,label,ticker,rows);total+=n
-            if ticker=="SPXW":spot=px
-        except Exception as e:event("EXPOSURE_ERROR",f"{ticker}: {type(e).__name__}: {e}")
-    try:await collect_options(client,label,observed,spot)
-    except Exception as e:event("OPTIONS_ERROR",f"{type(e).__name__}: {e}")
+            rows=await fetch_exposure(client,ticker)
+            n,px=save_exposure(observed,label,ticker,rows)
+            total+=n
+            spots[ticker]=px
+        except Exception as e:
+            event("EXPOSURE_ERROR",f"{ticker}: {type(e).__name__}: {e}")
+
+    # NEW: collect expiry-isolated SPY structure (0DTE + next listed expiry by default).
+    expiry_total=0
+    for ticker in EXPIRY_TICKERS:
+        try:
+            expiry_total+=await collect_expiry_structure(
+                client,label,observed,ticker,spots.get(ticker)
+            )
+        except Exception as e:
+            event("EXPIRY_ERROR",f"{ticker}: {type(e).__name__}: {e}")
+
+    # Existing SPX near-ATM option path collection.
+    try:
+        await collect_options(client,label,observed,spots.get("SPXW"))
+    except Exception as e:
+        event("OPTIONS_ERROR",f"{type(e).__name__}: {e}")
+
     if observed.minute%15==0:storage_health()
-    event("SNAPSHOT",f"{label}: saved {total} broad structural rows")
+    event("SNAPSHOT",f"{label}: saved {total} broad structural rows + {expiry_total} expiry-isolated rows")
 
 async def main():
     if not UW_TOKEN:raise SystemExit("UW_TOKEN is missing.")
     init_db()
-    event("START",f"DATA_ONLY_V2; DB={DB_PATH}; NO trading triggers/signals/rules; broad structure + symmetric ATM option paths")
+    event(
+        "START",
+        f"DATA_ONLY_V3; DB={DB_PATH}; NO trading triggers/signals/rules; "
+        f"broad aggregate structure + expiry-isolated structure "
+        f"(tickers={EXPIRY_TICKERS}, slots={EXPIRY_SLOTS}) + symmetric ATM option paths"
+    )
     headers={"Accept":"application/json","Authorization":UW_TOKEN}
     async with httpx.AsyncClient(headers=headers) as client:
-        rows=await fetch_exposure(client,"SPY");event("UW_TEST_OK",f"SPY endpoint returned {len(rows)} rows")
+        rows=await fetch_exposure(client,"SPY")
+        event("UW_TEST_OK",f"SPY endpoint returned {len(rows)} rows")
         last=None
         while True:
-            now=datetime.now(ET);label=active_window(now);key=now.strftime("%Y-%m-%d %H:%M")
+            now=datetime.now(ET)
+            label=active_window(now)
+            key=now.strftime("%Y-%m-%d %H:%M")
             if label and key!=last:
                 started=time.monotonic()
                 try:await collect_once(client,label)
                 except Exception as e:event("ERROR",f"{type(e).__name__}: {e}")
-                last=key;await asyncio.sleep(max(1,POLL_SECONDS-(time.monotonic()-started)))
-            else:await asyncio.sleep(10)
+                last=key
+                await asyncio.sleep(max(1,POLL_SECONDS-(time.monotonic()-started)))
+            else:
+                await asyncio.sleep(10)
 
-if __name__=="__main__":asyncio.run(main())
+if __name__=="__main__":
+    asyncio.run(main())
