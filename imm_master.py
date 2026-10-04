@@ -20,10 +20,10 @@ def levels(rows,spot,expiry):
  return sorted((x for x in data if x['distance']>0),key=lambda x:x['distance'])[:3],sorted((x for x in data if x['distance']<0),key=lambda x:-x['distance'])[:3]
 def make_row(now):
  date=now.astimezone(ET).date().isoformat();start=now-timedelta(seconds=5);exp=UW_STATE.expiries
- spot=UW_STATE.spot;above,below=levels(UW_STATE.rows,spot,exp[0] if exp else None)
+ spot=UW_STATE.spot if age(UW_STATE.spot_source,now) is not None and age(UW_STATE.spot_source,now)<=60 else None;above,below=levels(UW_STATE.rows,spot,exp[0] if exp else None)
  es=BOOK.snapshot(now)
  row=dict.fromkeys(COLUMNS)
- row.update(session_date_et=date,interval_start_utc=start.isoformat(),interval_end_utc=now.isoformat(),spx=spot,spx_source_time=UW_STATE.spot_source,spx_received_at=UW_STATE.spot_recv,spx_age_seconds=age(UW_STATE.spot_source,now),spx_carried=int(UW_STATE.spot_recv!=now.isoformat()) if spot is not None else None,uw_age_seconds=age(UW_STATE.updated,now),uw_rows=len(UW_STATE.rows),uw_0dte_expiry=exp[0] if exp else None,uw_next_expiry=exp[1] if len(exp)>1 else None,nearest_above_json=js(above),nearest_below_json=js(below),source_status_json=js({'spx_price_verified_five_second':False,'uw':UW_STATE.quality,'es_valid':bool(es.get('es_book_valid'))}))
+ row.update(session_date_et=date,interval_start_utc=start.isoformat(),interval_end_utc=now.isoformat(),spx=spot,spx_source_time=UW_STATE.spot_source,spx_received_at=UW_STATE.spot_recv,spx_age_seconds=age(UW_STATE.spot_source,now),spx_carried=int(age(UW_STATE.spot_source,now)>5) if spot is not None and age(UW_STATE.spot_source,now) is not None else None,uw_age_seconds=age(UW_STATE.updated,now),uw_rows=len(UW_STATE.rows),uw_0dte_expiry=exp[0] if exp else None,uw_next_expiry=exp[1] if len(exp)>1 else None,nearest_above_json=js(above),nearest_below_json=js(below),source_status_json=js({'spx_price_verified_five_second':False,'uw':UW_STATE.quality,'es_valid':bool(es.get('es_book_valid'))}))
  row.update(es)
  return row
 async def run():
@@ -35,7 +35,11 @@ async def run():
   if end==last:continue
   last=end
   # 09:30–11:30: full master; 11:30–12:00: price-only continuation.
-  if local.time().replace(tzinfo=None)>=dtime(11,30):continue
+  if local.time().replace(tzinfo=None)>=dtime(11,30):
+   # Price-only continuation: never invent a new price or timestamp.
+   if UW_STATE.spot is not None and UW_STATE.spot_source and age(UW_STATE.spot_source,end) is not None:
+    write('INSERT OR IGNORE INTO price_continuation VALUES(?,?,?,?,?)',(end.isoformat(),local.date().isoformat(),UW_STATE.spot,UW_STATE.spot_source,age(UW_STATE.spot_source,end)))
+   continue
   row=make_row(end);cols=','.join(COLUMNS)
   write(f'INSERT OR REPLACE INTO master ({cols}) VALUES ({",".join("?" for _ in COLUMNS)})',tuple(row.get(k) for k in COLUMNS))
   if end.minute%15==0 and end.second==0:

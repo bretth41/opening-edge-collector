@@ -12,6 +12,8 @@ CREATE INDEX IF NOT EXISTS idx_strike_day ON strike_history(session_date_et,expi
 CREATE TABLE IF NOT EXISTS option_tape(trade_key TEXT PRIMARY KEY,received_at TEXT,executed_at TEXT,option_symbol TEXT,expiry TEXT,strike REAL,side TEXT,price REAL,size REAL,bid REAL,ask REAL,condition TEXT,raw_json TEXT);
 CREATE TABLE IF NOT EXISTS es_event(event_key TEXT PRIMARY KEY,received_at TEXT,event_at TEXT,instrument_id INTEGER,action TEXT,side TEXT,price REAL,size INTEGER,order_id TEXT,flags INTEGER,raw_json TEXT);
 CREATE TABLE IF NOT EXISTS price_history(received_at TEXT PRIMARY KEY,source_time TEXT,session_date_et TEXT,spx REAL,source TEXT);
+CREATE TABLE IF NOT EXISTS price_continuation(interval_end_utc TEXT PRIMARY KEY,session_date_et TEXT,spx REAL,spx_source_time TEXT,spx_age_seconds REAL);
+CREATE TABLE IF NOT EXISTS tape_checkpoint(session_date_et TEXT PRIMARY KEY, newest_seen TEXT, last_complete_at TEXT, incomplete INTEGER, detail TEXT);
 CREATE TABLE IF NOT EXISTS audit(at TEXT,source TEXT,level TEXT,detail TEXT);
 '''
 def connect():

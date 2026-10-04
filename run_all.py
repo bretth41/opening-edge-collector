@@ -10,10 +10,12 @@ async def web():
  s=uvicorn.Server(uvicorn.Config(app,host='0.0.0.0',port=int(os.getenv('PORT','8080')),access_log=False));await s.serve()
 async def main():
  init()
- if not os.getenv('UW_TOKEN') or not os.getenv('DATABENTO_API_KEY'):
-  audit('START','ERROR','Missing UW_TOKEN or DATABENTO_API_KEY');raise SystemExit('Missing data credentials')
+ if not os.getenv('UW_TOKEN'):
+  audit('START','ERROR','Missing UW_TOKEN');raise SystemExit('Missing data credentials')
  audit('START','INFO','IMM v3: collection only, no signals; new isolated database')
- tasks=[asyncio.create_task(f()) for f in (web,UW_STATE.poll,UW_STATE.stream_price,run_es,run_master,run_tape)]
+ tasks=[asyncio.create_task(f()) for f in (web,UW_STATE.poll,run_master,run_tape)]
+ if os.getenv('DATABENTO_API_KEY'):tasks.append(asyncio.create_task(run_es()))
+ else:audit('ES','WARN','No Databento key; ES fields will remain missing')
  done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_EXCEPTION)
  for t in pending:t.cancel()
  for t in done:

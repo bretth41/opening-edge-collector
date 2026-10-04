@@ -11,11 +11,13 @@ def parse(s):
  m=OPTION.match(str(s or ''))
  return (f'20{m[1][:2]}-{m[1][2:4]}-{m[1][4:]}',m[2],int(m[3])/1000) if m else None
 class UW:
- def __init__(self):self.lock=asyncio.Lock();self.spot=None;self.spot_source=None;self.spot_recv=None;self.updated=None;self.rows={};self.expiries=[];self.last_price=None;self.quality={}
+ def __init__(self):self.lock=asyncio.Lock();self.spot=None;self.spot_source=None;self.spot_recv=None;self.updated=None;self.rows={};self.expiries=[];self.last_price=None;self.quality={};self.last_rest_price_check=None
  def update_spot(self,price,source,received):
   if price is None:return
-  with_time=source or received
-  if self.spot_source and with_time<self.spot_source:return
+  # A REST response without an exchange timestamp is not a fresh price observation.
+  if not source:return
+  with_time=source
+  if self.spot_source and with_time<=self.spot_source:return
   self.spot=price;self.spot_source=with_time;self.spot_recv=received
   if self.last_price!=(with_time,price):
    write('INSERT OR IGNORE INTO price_history VALUES(?,?,?,?,?)',(received,with_time,datetime.now(ET).date().isoformat(),price,'UW'))
@@ -34,7 +36,10 @@ class UW:
   exp=await self.get(c,'/api/stock/SPX/expiry-breakdown')
   dates=sorted({str(x.get('expires')) for x in exp if x.get('expires') and str(x.get('expires'))>=day})[:2]
   if not dates or dates[0]!=day:
-   audit('UW','WARN',f'No confirmed SPX 0DTE expiry for {day}: {dates}');return
+   # Weekend/holiday responses are not evidence of an intraday data failure.
+   if now.astimezone(ET).weekday()<5 and 9<=now.astimezone(ET).hour<16:
+    audit('UW','WARN',f'No confirmed SPX 0DTE expiry for {day}: {dates}')
+   self.quality={'last_attempt':recv,'zero_dte_confirmed':False,'available_expiries':dates};self.expiries=[];self.rows={};return
   self.expiries=dates;total=0;updated={}
   for rank,expiry in enumerate(dates):
    greeks,contracts=await asyncio.gather(self.get(c,'/api/stock/SPX/greeks',{'expiry':expiry}),self.contracts(c,expiry))
@@ -52,6 +57,7 @@ class UW:
      cp[side]=bysym.get(sym,{})
     source=g.get('time') or g.get('timestamp') or None
     source=str(source) if source else None
+    if source and not ('T' in source and ('+' in source or source.endswith('Z'))):source=None
     price=num(g.get('price'))
     if price is not None:self.update_spot(price,source,recv)
     record={'expiry':expiry,'rank':rank,'strike':strike,'greeks':g,'contracts':cp,'source':source,'received':recv}
@@ -60,7 +66,7 @@ class UW:
    many('INSERT OR REPLACE INTO strike_history VALUES(?,?,?,?,?,?,?,?,?,?)',rows)
    total+=len(rows)
   async with self.lock:self.rows=updated;self.updated=recv
-  self.quality={'last_success':recv,'strike_count':total,'expiry_count':len(dates)}
+  self.quality={'last_success':recv,'strike_count':total,'expiry_count':len(dates),'zero_dte_confirmed':bool(dates and dates[0]==day),'price_available':self.spot is not None}
  async def stream_price(self):
   """SPX websocket price from UW gex_strike_expiry; validates actual cadence live."""
   import websockets,json
@@ -85,5 +91,6 @@ class UW:
    while True:
     try:await self.once(c)
     except Exception as e:audit('UW','ERROR',f'{type(e).__name__}: {str(e)[:250]}')
-    await asyncio.sleep(int(os.getenv('IMM_UW_POLL_SECONDS','60')))
+    # REST is Basic-plan primary; do not depend on websocket entitlement.
+    await asyncio.sleep(max(15,int(os.getenv('IMM_UW_POLL_SECONDS','60'))))
 UW_STATE=UW()
