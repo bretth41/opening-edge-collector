@@ -1,35 +1,25 @@
-# Opening + Closing Edge Collector — Railway V2
+# IMM v3 candidate — connection-validation build
 
-## What it does
-A small always-on Python worker that uses the Unusual Whales REST API once per minute during two Eastern-time windows:
+Follows IMM Requirements & Architecture v2.1, collection first. **Not production-validated**. No scores, alerts, labels or option-P&L logic.
 
-- Opening collection: 9:25–10:30 AM ET (primary study: 9:30–10:15)
-- Closing collection: 3:30–4:00 PM ET (primary study: 3:40–4:00; 3:30–3:40 is control)
+## Before upload
+This candidate has important outstanding gates: actual UW SPX websocket and REST entitlement; actual Databento MBO record/snapshot interpretation and ES rollover; SPX five-second cadence. Do not replace the running production collector until these gates pass. Existing `/data/opening_edge_v2.db` is preserved; v3 uses `/data/imm_v3.db`.
 
-It stores strike-level SPY and SPXW delta/gamma/charm/vanna snapshots in SQLite. On every startup it first makes a SPY test request. If the Basic API plan does not permit the endpoint, the Railway log will say `UW_TEST_FAILED`; if it works, it says `UW_TEST_OK`.
+## Source architecture
+- Databento live `GLBX.MDP3`, `mbo`, `ES.c.0`, snapshot requested. Native events retained temporarily in `es_event`, with book-derived five-second aggregates. ES is never labeled SPX.
+- UW `gex_strike_expiry:SPX` websocket provides provisional SPX observed price; `SPX` expiry-specific Greeks and fully paginated contracts polled once per minute. Timestamp/freshness preserved. No fabricated five-second SPX prices.
+- Full primary 0DTE + secondary next listed expiry strike history. Neutral proximity top-three levels per side; all available strikes retained. SPX options tape uses UW cursor-based REST polling; endpoint entitlement, pagination completeness and ES snapshot integrity require live validation.
+- 09:30–11:30 ET master five-second rows. 11:30–12:00 ET SPX price history continues via websocket; stream subscription runs beyond noon.
 
-## Security
-Never place the real UW API token in this folder or GitHub. Add it only in Railway's Variables screen as `UW_TOKEN`.
+## Safe installation
+Recommended: use a **separate Railway service and volume** for parallel validation, or create a GitHub staging branch without touching production main. Keep secrets in Railway Variables (`UW_TOKEN`, `DATABENTO_API_KEY`, `EDGE_DASH_PASSWORD`), set `IMM_DB=/data/imm_v3.db` and leave `EDGE_DB` untouched. Set Railway service start command `python run_all.py`.
 
-## Railway settings
-- Start command is already supplied by `railway.toml`: `python collector.py`
-- Add a persistent Volume mounted at `/data`
-- Add variable `UW_TOKEN` with the real token
-- Optional variables are shown in `.env.example`
-- This is a persistent background service, not a Railway Cron Job. The code itself understands Eastern Time and daylight-saving changes and sleeps outside collection windows.
+## Acceptance gates before production promotion
+1. Prove both vendor entitlements with actual live data; confirm exact UW SPX vs SPXW semantics, Greek units and strike timestamps.
+2. Prove ES snapshot completion, feed gap recovery, correct trade/cancel/modify semantics, front-month rollover and reproducible replay.
+3. Validate SPX 0DTE option trade tape completeness and multi-leg identification (multi-leg classification remains pending).
+4. Observe SPX price source age, at least one complete morning, 1440 master rows, complete 0DTE strike coverage, no lookahead, source freshness, compressed export.
+5. Define measured raw ES retention/storage cap and off-volume backup. Raw event deletion disabled by default.
 
-## What a healthy deployment looks like
-In Railway Logs after deployment, expect:
-
-`START: DB=/data/opening_edge.db ...`
-
-followed by either:
-
-`UW_TEST_OK: SPY endpoint returned ... rows`
-
-or a clear `UW_TEST_FAILED` message.
-
-During a collection window, each minute should produce a `SNAPSHOT` line.
-
-## Why V2 stops here
-This version proves reliable minute-by-minute gamma migration capture first. The next layer will add 0DTE option premium/IV capture after we verify which option endpoints the Basic subscription permits. That prevents us from building around an unavailable endpoint.
+## Download
+The existing research service is untouched in staging. New authenticated `/export?start=YYYY-MM-DD&end=YYYY-MM-DD` creates a ZIP; `/status` shows row counts.
