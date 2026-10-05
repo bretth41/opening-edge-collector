@@ -34,23 +34,32 @@ class UW:
    x=await self.get(c,"/api/stock/SPX/option-contracts",{"expiry":expiry,"page":page,"limit":500});out+=x
    if len(x)<500:return out
   raise RuntimeError("UW contract pagination safety limit exceeded")
+ async def exposures(self,c,day,expiry):
+  return await self.get(c,"/api/stock/SPX/greek-exposure/strike-expiry",{"date":day,"expiry":expiry})
  async def once(self,c):
   now=datetime.now(timezone.utc);recv=now.isoformat();day=now.astimezone(ET).date().isoformat();syms=await self.symbols(c,day)
   expiries=sorted({p[0] for s in syms if (p:=parse(s)) and p[0]>=day})[:2]
   if not expiries or expiries[0]!=day:
    self.expiries=[];self.rows={};self.quality={"last_attempt":recv,"zero_dte_confirmed":False,"expiry_discovery":"SPX option-chains symbols","symbol_count":len(syms),"available_expiries":expiries};audit("UW","WARN",f"option-chains did not confirm 0DTE {day}; symbols={len(syms)} expiries={expiries}");return
-  updated={};total=0;ng=0
+  updated={};total=0;ne=0
   for rank,expiry in enumerate(expiries):
-   gs=await self.get(c,"/api/stock/SPX/greeks",{"date":day,"expiry":expiry});cs=await self.contracts(c,expiry);bysym={x.get("option_symbol"):x for x in cs if isinstance(x,dict) and x.get("option_symbol")};byg={num(g.get("strike")):g for g in gs if num(g.get("strike")) is not None}
+   es=await self.exposures(c,day,expiry);cs=await self.contracts(c,expiry)
+   bysym={x.get("option_symbol"):x for x in cs if isinstance(x,dict) and x.get("option_symbol")}
+   bye={num(x.get("strike")):x for x in es if isinstance(x,dict) and num(x.get("strike")) is not None}
    strikes=sorted({p[2] for s in syms if (p:=parse(s)) and p[0]==expiry});batch=[]
    for strike in strikes:
-    g=byg.get(strike,{});cp={}
+    e=bye.get(strike,{})
+    g={"call_gamma_oi":e.get("call_gex"),"put_gamma_oi":e.get("put_gex"),"call_delta_oi":e.get("call_delta"),"put_delta_oi":e.get("put_delta"),"call_charm_oi":e.get("call_charm"),"put_charm_oi":e.get("put_charm"),"call_vanna_oi":e.get("call_vanna"),"put_vanna_oi":e.get("put_vanna"),"dte":e.get("dte")}
+    cp={}
     for side,typ in (("call","C"),("put","P")):
      sym=next((s for s in syms if (p:=parse(s)) and p[0]==expiry and p[1]==typ and p[2]==strike),None);cp[side]=bysym.get(sym,{})
-    source=str(g.get("time") or g.get("timestamp") or "") or None;updated[(expiry,strike)]={"expiry":expiry,"rank":rank,"strike":strike,"greeks":g,"contracts":cp,"source":source,"received":recv};batch.append((recv,source,day,expiry,rank,strike,None,js(g),js(cp),None))
-   many("INSERT OR REPLACE INTO strike_history VALUES(?,?,?,?,?,?,?,?,?,?)",batch);total+=len(batch);ng+=len(gs)
+    source=str(e.get("date") or "") or None
+    updated[(expiry,strike)]={"expiry":expiry,"rank":rank,"strike":strike,"greeks":g,"contracts":cp,"source":source,"received":recv}
+    batch.append((recv,source,day,expiry,rank,strike,None,js(g),js(cp),js(e) if e else None))
+   many("INSERT OR REPLACE INTO strike_history VALUES(?,?,?,?,?,?,?,?,?,?)",batch);total+=len(batch);ne+=len(es)
   async with self.lock:self.rows=updated;self.expiries=expiries;self.updated=recv
-  self.quality={"last_success":recv,"zero_dte_confirmed":True,"expiry_discovery":"SPX option-chains symbols","symbol_count":len(syms),"strike_count":total,"greek_rows":ng,"available_expiries":expiries,"uw_is_spx_price_source":False};audit("UW","INFO",f"SPX 0DTE confirmed {expiries[0]}; next={expiries[1] if len(expiries)>1 else None}; strikes={total}; greek_rows={ng}")
+  self.quality={"last_success":recv,"zero_dte_confirmed":True,"expiry_discovery":"SPX option-chains symbols","exposure_source":"SPX greek-exposure/strike-expiry","symbol_count":len(syms),"strike_count":total,"exposure_rows":ne,"available_expiries":expiries,"uw_is_spx_price_source":False}
+  audit("UW","INFO",f"SPX 0DTE confirmed {expiries[0]}; next={expiries[1] if len(expiries)>1 else None}; strikes={total}; exposure_rows={ne}")
  async def poll(self):
   async with httpx.AsyncClient(headers={"Authorization":os.environ["UW_TOKEN"],"Accept":"application/json"}) as c:
    while True:

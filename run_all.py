@@ -10,7 +10,7 @@ async def web():await uvicorn.Server(uvicorn.Config(app,host="0.0.0.0",port=int(
 async def main():
  init();missing=[x for x in ("UW_TOKEN","MASSIVE_API_KEY") if not os.getenv(x)]
  if missing:audit("START","ERROR","Missing: "+",".join(missing));raise SystemExit("Missing credentials")
- audit("START","INFO","IMM v4.0: Massive SPX + UW SPXW + Databento ES MBP-1; no signals")
+ audit("START","INFO","IMM v4.1: Massive SPX + UW SPXW exposure + Databento ES MBP-1; no signals")
  tasks=[asyncio.create_task(f()) for f in (web,UW_STATE.poll,run_massive,run_master,run_tape)]
  if os.getenv("DATABENTO_API_KEY"):tasks.append(asyncio.create_task(run_es()))
  else:audit("ES","WARN","No Databento key")
