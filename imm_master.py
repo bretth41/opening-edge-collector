@@ -23,13 +23,12 @@ def make(n):
 async def run():
  last=None
  while True:
-  n=datetime.now(timezone.utc);await asyncio.sleep(max(.01,5-n.timestamp()%5+.08));n=datetime.now(timezone.utc);end=datetime.fromtimestamp(int(n.timestamp()//5)*5,timezone.utc);local=end.astimezone(ET)
-  if local.weekday()>4 or not dtime(9,30)<=local.time().replace(tzinfo=None)<dtime(12):continue
+  n=datetime.now(timezone.utc);await asyncio.sleep(max(.01,5-n.timestamp()%5+.08));n=datetime.now(timezone.utc);end=datetime.fromtimestamp(int(n.timestamp()//5)*5,timezone.utc);local=end.astimezone(ET);lt=local.time().replace(tzinfo=None)
+  if local.weekday()>4 or not dtime(9,30)<=lt<dtime(16):continue
   if end==last:continue
   last=end
-  if local.time().replace(tzinfo=None)>=dtime(11,30):
+  r=make(end);cols=",".join(COLUMNS);write(f'INSERT OR REPLACE INTO master ({cols}) VALUES ({",".join("?" for _ in COLUMNS)})',tuple(r.get(k) for k in COLUMNS))
+  if lt>=dtime(11,30):
    a=age(SPX.source_time,end)
    if SPX.price is not None and a is not None and a<=5:write("INSERT OR IGNORE INTO price_continuation VALUES(?,?,?,?,?)",(end.isoformat(),local.date().isoformat(),SPX.price,SPX.source_time,a))
-   continue
-  r=make(end);cols=",".join(COLUMNS);write(f'INSERT OR REPLACE INTO master ({cols}) VALUES ({",".join("?" for _ in COLUMNS)})',tuple(r.get(k) for k in COLUMNS))
   if end.minute%15==0 and end.second==0:audit("MASTER","INFO",f'v4 rows live; disk_free_mb={shutil.disk_usage(DB.parent).free//1048576}; spx_age={r["spx_age_seconds"]}; uw_rows={r["uw_rows"]}; es_valid={r["es_book_valid"]}')
