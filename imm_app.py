@@ -5,7 +5,7 @@ from fastapi.security import HTTPBasic,HTTPBasicCredentials
 from fastapi.responses import FileResponse,HTMLResponse
 from starlette.background import BackgroundTask
 from imm_store import DB,connect
-app=FastAPI(docs_url=None,redoc_url=None,title='IMM Collector v3')
+app=FastAPI(docs_url=None,redoc_url=None,title='IMM Collector v3.2')
 sec=HTTPBasic(auto_error=False)
 def auth(c:HTTPBasicCredentials=Depends(sec)):
  if not os.getenv('EDGE_DASH_PASSWORD') or not c or not secrets.compare_digest(c.password,os.getenv('EDGE_DASH_PASSWORD')):raise HTTPException(401,headers={'WWW-Authenticate':'Basic'})
@@ -19,8 +19,8 @@ def health():
  try:
   with connect() as c:
    n=c.execute('SELECT COUNT(*) FROM master').fetchone()[0];latest=c.execute('SELECT MAX(interval_end_utc) FROM master').fetchone()[0]
-  return {'ok':True,'version':'imm-v3','master_rows':n,'last_master_row':latest,'db':DB.name}
- except Exception:return {'ok':False,'version':'imm-v3'}
+  return {'ok':True,'version':'imm-v3.2','master_rows':n,'last_master_row':latest,'db':DB.name}
+ except Exception:return {'ok':False,'version':'imm-v3.2'}
 @app.get('/status',dependencies=[Depends(auth)])
 def status():
  with connect() as c:
@@ -29,7 +29,7 @@ def status():
 def export(start:str,end:str):
  a,b=dates(start,end);lo=a.isoformat();hi=(b+timedelta(days=1)).isoformat();fd,path=tempfile.mkstemp(suffix='.zip',prefix='imm_');os.close(fd)
  tables={'master':'session_date_et','strike_history':'session_date_et','price_history':'session_date_et','option_tape':'received_at','audit':'at','price_continuation':'session_date_et','tape_checkpoint':'session_date_et'}
- manifest={'version':'imm-v3','start':lo,'end':b.isoformat(),'timezone':'America/New_York','five_second_master_expected':1440,'spx_price_cadence':'observed only; inspect source age','tables':{}}
+ manifest={'version':'imm-v3.2','start':lo,'end':b.isoformat(),'timezone':'America/New_York','five_second_master_expected':1440,'spx_price_cadence':'observed only; inspect source age','tables':{}}
  with connect() as c,zipfile.ZipFile(path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
   for table,col in tables.items():
    if table in ('audit','option_tape'):

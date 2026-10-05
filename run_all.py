@@ -12,7 +12,7 @@ async def main():
  init()
  if not os.getenv('UW_TOKEN'):
   audit('START','ERROR','Missing UW_TOKEN');raise SystemExit('Missing data credentials')
- audit('START','INFO','IMM v3: collection only, no signals; new isolated database')
+ audit('START','INFO','IMM v3.2: UW REST + ES MBP-1 collection; no signals')
  tasks=[asyncio.create_task(f()) for f in (web,UW_STATE.poll,run_master,run_tape)]
  if os.getenv('DATABENTO_API_KEY'):tasks.append(asyncio.create_task(run_es()))
  else:audit('ES','WARN','No Databento key; ES fields will remain missing')

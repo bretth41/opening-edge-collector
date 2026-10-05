@@ -18,8 +18,18 @@ CREATE TABLE IF NOT EXISTS audit(at TEXT,source TEXT,level TEXT,detail TEXT);
 '''
 def connect():
  c=sqlite3.connect(DB,timeout=30);c.row_factory=sqlite3.Row;c.execute('PRAGMA busy_timeout=30000');return c
+EXTRA_MASTER_COLUMNS={
+'es_bid_order_count':'INTEGER','es_ask_order_count':'INTEGER','es_trade_buy_count':'INTEGER','es_trade_sell_count':'INTEGER',
+'es_mid_start':'REAL','es_mid_end':'REAL','es_mid_high':'REAL','es_mid_low':'REAL','es_mid_change_ticks':'REAL','es_range_ticks':'REAL',
+'es_trade_imbalance':'REAL','es_depth_imbalance_end':'REAL','es_displacement_ticks_per_100_contracts':'REAL',
+'es_bid_replenish_proxy':'REAL','es_ask_replenish_proxy':'REAL','es_bid_deplete_proxy':'REAL','es_ask_deplete_proxy':'REAL',
+'es_bid_withdraw_proxy':'REAL','es_ask_withdraw_proxy':'REAL','es_bid_absorption_proxy':'REAL','es_ask_absorption_proxy':'REAL'}
 def init():
- with LOCK,connect() as c:c.executescript(SCHEMA)
+ with LOCK,connect() as c:
+  c.executescript(SCHEMA)
+  have={r[1] for r in c.execute('PRAGMA table_info(master)')}
+  for name,typ in EXTRA_MASTER_COLUMNS.items():
+   if name not in have:c.execute(f'ALTER TABLE master ADD COLUMN {name} {typ}')
 def write(sql,args):
  with LOCK,connect() as c:c.execute(sql,args)
 def many(sql,args):
