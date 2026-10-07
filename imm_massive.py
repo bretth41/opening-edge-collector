@@ -1,9 +1,8 @@
 import asyncio,json,os
 from datetime import datetime,timezone
-from zoneinfo import ZoneInfo
 import websockets
-from imm_store import write,audit
-ET=ZoneInfo("America/New_York"); URL="wss://socket.massive.com/indices"; SUB="A.I:SPX"
+from imm_store import audit
+URL="wss://socket.massive.com/indices";SUB="A.I:SPX"
 def iso_ms(v):
  try:return datetime.fromtimestamp(int(v)/1000,timezone.utc).isoformat()
  except Exception:return None
@@ -17,9 +16,7 @@ class SPXState:
   if m.get("ev")!="A" or m.get("sym")!="I:SPX":return
   px=num(m.get("c"));src=iso_ms(m.get("e"))
   if px is None or src is None or (self.source_time and src<=self.source_time):return
-  recv=datetime.now(timezone.utc).isoformat();self.price=px;self.source_time=src;self.received_at=recv
-  day=datetime.fromisoformat(src).astimezone(ET).date().isoformat()
-  write("INSERT OR IGNORE INTO price_history VALUES(?,?,?,?,?)",(recv,src,day,px,"MASSIVE:I:SPX:A1S"))
+  self.price=px;self.source_time=src;self.received_at=datetime.now(timezone.utc).isoformat()
  def quality(self):return {"connected":self.connected,"authenticated":self.authenticated,"subscribed":self.subscribed,"channel":SUB,"reconnects":self.reconnects,"last_status":self.last_status}
 SPX=SPXState()
 async def run():
@@ -39,7 +36,7 @@ async def run():
        if status=="auth_success" and not SPX.authenticated:
         SPX.authenticated=True;await ws.send(json.dumps({"action":"subscribe","params":SUB}));continue
        if status=="success" and "subscribed" in str(m.get("message","")).lower():
-        if not SPX.subscribed:SPX.subscribed=True;audit("MASSIVE","INFO","real-time SPX subscribed A.I:SPX")
+        if not SPX.subscribed:SPX.subscribed=True;audit("MASSIVE","INFO","real-time SPX subscribed")
         continue
        if status in ("auth_failed","not_authorized","max_connections","error"):raise RuntimeError(f"Massive status: {m}")
       else:SPX.update(m)
