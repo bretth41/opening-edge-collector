@@ -42,3 +42,4 @@ async def run():
       else:SPX.update(m)
   except Exception as e:
    SPX.reconnects+=1;SPX.connected=SPX.authenticated=SPX.subscribed=False;audit("MASSIVE","ERROR",f"{type(e).__name__}: {str(e)[:300]}; reconnect in 5s");await asyncio.sleep(5)
+

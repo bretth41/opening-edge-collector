@@ -2,3 +2,4 @@
 startCommand = "python run_all.py"
 healthcheckPath = "/health"
 restartPolicyType = "ON_FAILURE"
+

@@ -39,10 +39,23 @@ class ESBook:
   if os.getenv("IMM_RAW_ES","1")=="1":write("INSERT OR IGNORE INTO es_event VALUES(?,?,?,?,?,?,?,?,?,?,?)",(f"{receipt}:{self.seq}",receipt,ts(getattr(r,"ts_event",None)),self.instrument,action,side,px(getattr(r,"price",None)),q,None,int(getattr(r,"flags",0) or 0),js({"bid":nb,"ask":na,"bid_sz":nbs,"ask_sz":nas,"bid_ct":nbc,"ask_ct":nac})))
  def mapping(self,r):
   if str(getattr(r,"stype_in_symbol",""))=="ES.c.0":self.contract=str(getattr(r,"stype_out_symbol","") or "") or self.contract
+ def quality(self,now):
+  with self.lock:
+   age=(now-datetime.fromisoformat(self.last)).total_seconds() if self.last else None
+   return {'schema':'mbp-1','depth_levels':1,'contract':self.contract,'valid_and_fresh':bool(self.valid and age is not None and -2<=age<=2),'receipt_age_seconds':max(0,age) if age is not None else None,'feed_resets':self.gap,'absorption_available':False,'withdrawal_available':False}
  def snapshot(self,now):
   with self.lock:
-   v=self.valid and self.bid is not None and self.ask is not None and self.bid<self.ask;c=dict(self.counters);self.counters.clear();w=self.window;self.window={};mid=(self.bid+self.ask)/2 if v else None;start=w.get("mid_start") if w else None;chg=(mid-start)/TICK if mid is not None and start is not None else None;rng=(w.get("mid_high")-w.get("mid_low"))/TICK if w and w.get("mid_high") is not None and w.get("mid_low") is not None else None;tot=c.get("es_trade_buy",0)+c.get("es_trade_sell",0);den=(self.bid_sz or 0)+(self.ask_sz or 0)
-   out={"es_contract":self.contract,"es_instrument_id":self.instrument,"es_bid":self.bid if v else None,"es_ask":self.ask if v else None,"es_spread":self.ask-self.bid if v else None,"es_bid_depth_1":self.bid_sz if v else None,"es_ask_depth_1":self.ask_sz if v else None,"es_bid_depth_5":None,"es_ask_depth_5":None,"es_bid_order_count":self.bid_ct if v else None,"es_ask_order_count":self.ask_ct if v else None,"es_mid_start":start,"es_mid_end":mid,"es_mid_high":w.get("mid_high") if w else None,"es_mid_low":w.get("mid_low") if w else None,"es_mid_change_ticks":chg,"es_range_ticks":rng,"es_trade_imbalance":c.get("es_trade_buy",0)-c.get("es_trade_sell",0),"es_depth_imbalance_end":((self.bid_sz or 0)-(self.ask_sz or 0))/den if den else None,"es_displacement_ticks_per_100_contracts":chg*100/tot if chg is not None and tot else None,"es_last_event_at":self.last,"es_age_seconds":(now-datetime.fromisoformat(self.last)).total_seconds() if self.last else None,"es_book_valid":int(v),"es_feed_gap":self.gap};out.update(c);return out
+   age=(now-datetime.fromisoformat(self.last)).total_seconds() if self.last else None;v=self.valid and self.bid is not None and self.ask is not None and self.bid<self.ask and age is not None and -2<=age<=2;c=dict(self.counters);self.counters.clear();w=self.window;self.window={};mid=(self.bid+self.ask)/2 if v else None;start=w.get("mid_start") if w else None;chg=(mid-start)/TICK if mid is not None and start is not None else None;rng=(w.get("mid_high")-w.get("mid_low"))/TICK if w and w.get("mid_high") is not None and w.get("mid_low") is not None else None;tot=c.get("es_trade_buy",0)+c.get("es_trade_sell",0);den=(self.bid_sz or 0)+(self.ask_sz or 0)
+   out={"es_contract":self.contract,"es_instrument_id":self.instrument,"es_bid":self.bid if v else None,"es_ask":self.ask if v else None,"es_spread":self.ask-self.bid if v else None,"es_bid_depth_1":self.bid_sz if v else None,"es_ask_depth_1":self.ask_sz if v else None,"es_bid_depth_5":None,"es_ask_depth_5":None,"es_bid_order_count":self.bid_ct if v else None,"es_ask_order_count":self.ask_ct if v else None,"es_mid_start":start,"es_mid_end":mid,"es_mid_high":w.get("mid_high") if w else None,"es_mid_low":w.get("mid_low") if w else None,"es_mid_change_ticks":chg,"es_range_ticks":rng,"es_trade_imbalance":c.get("es_trade_buy",0)-c.get("es_trade_sell",0),"es_depth_imbalance_end":((self.bid_sz or 0)-(self.ask_sz or 0))/den if den else None,"es_displacement_ticks_per_100_contracts":chg*100/tot if chg is not None and tot else None,"es_last_event_at":self.last,"es_age_seconds":(now-datetime.fromisoformat(self.last)).total_seconds() if self.last else None,"es_book_valid":int(v),"es_feed_gap":self.gap};out.update(c)
+   # MBP-1 book snapshots/trades do not identify cancellations or true absorption.
+   # Historical columns stay for compatibility; never label traded volume as absorption.
+   for key in ('es_bid_absorption_proxy','es_ask_absorption_proxy','es_bid_withdraw_proxy','es_ask_withdraw_proxy'):out[key]=None
+   if not v:
+    for key in ('es_depth_imbalance_end','es_displacement_ticks_per_100_contracts','es_mid_start','es_mid_end','es_mid_high','es_mid_low','es_mid_change_ticks','es_range_ticks','es_trade_imbalance'):out[key]=None
+   for key in ('es_trade_buy','es_trade_sell','es_trade_buy_count','es_trade_sell_count','es_events','es_bid_replenish_proxy','es_ask_replenish_proxy','es_bid_deplete_proxy','es_ask_deplete_proxy'):
+    out[key]=c.get(key,0) if v and c.get('es_events',0)>0 else None
+   out['es_age_seconds']=max(0,age) if age is not None else None
+   return out
 BOOK=ESBook()
 def live():
  import databento as db
@@ -54,3 +67,4 @@ def live():
     if hasattr(r,"action"):BOOK.update(r,datetime.now(timezone.utc).isoformat())
   except Exception as e:BOOK.reset();audit("ES","ERROR",f"{type(e).__name__}: {str(e)[:300]}; reconnect in 10s");time.sleep(10)
 async def run():await asyncio.to_thread(live)
+
